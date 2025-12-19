@@ -6,7 +6,7 @@ import os
 import re
 from datetime import datetime
 from io import StringIO
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 import requests
 import pandas as pd
@@ -55,7 +55,6 @@ def to_number(x) -> float | None:
 
 
 def fmt_int(n: float | int) -> str:
-    # 1,316,300
     try:
         return f"{int(round(float(n))):,}"
     except Exception:
@@ -138,67 +137,70 @@ def fetch_live_usd_aed_from_currency() -> Tuple[float, float]:
 
 
 # -------------------------
-# TGJU crypto (USDT)
+# TGJU crypto (USDT) - robust
 # -------------------------
-def fetch_live_usdt_from_crypto() -> float:
+def _row_contains_usdt(row_values: List[str]) -> bool:
+    txt = " ".join(norm(x) for x in row_values).lower()
+    return ("تتر" in txt) or ("usdt" in txt)
+
+
+def fetch_live_usdt_from_crypto(usd_hint: float) -> float:
+    """
+    Robust extraction:
+    - Read all tables
+    - Find a row containing 'تتر' or 'USDT'
+    - Pick the numeric in that row that is closest to usd_hint (USDT in toman ~ USD)
+    """
     r = requests.get(CRYPTO_URL, headers=HEADERS, timeout=25)
     r.raise_for_status()
 
     tables = pd.read_html(StringIO(r.text))
-    # جدول/ستون‌ها در crypto ممکنه متفاوت باشه؛ ما انعطاف‌پذیر می‌گردیم:
-    candidates = []
-    for t in tables:
-        cols = [norm(c) for c in list(t.columns)]
-        if "عنوان" in cols:
-            candidates.append((t.copy(), cols))
+    if not tables:
+        raise RuntimeError("هیچ جدولی از صفحه crypto استخراج نشد (ممکن است سایت لحظه‌ای محدود کرده باشد).")
 
-    if not candidates:
-        raise RuntimeError("هیچ جدولی با ستون 'عنوان' در صفحه crypto پیدا نشد (احتمالاً ساختار صفحه تغییر کرده).")
+    best_candidate = None  # (abs_diff, value, table_idx, row_idx)
 
-    # پیدا کردن ستون قیمت: یکی از این‌ها
-    price_col_names = {"قیمت", "قیمت زنده", "قیمت لحظه ای", "آخرین قیمت", "آخرین"}
-    for df, cols in candidates:
-        df.columns = [norm(c) for c in df.columns]
-        df["عنوان"] = df["عنوان"].apply(norm)
-
-        # ستون قیمت را پیدا کن
-        price_col = None
-        for c in df.columns:
-            if norm(c) in price_col_names:
-                price_col = c
-                break
-        # اگر اسم دقیق نبود، یک ستون عددیِ محتمل را حدس بزن
-        if price_col is None:
-            # اولین ستونی که غیر از "عنوان" هست و عدد می‌دهد
-            for c in df.columns:
-                if c == "عنوان":
-                    continue
-                sample = df[c].dropna().head(5).astype(str).tolist()
-                if any(to_number(x) is not None for x in sample):
-                    price_col = c
-                    break
-
-        if price_col is None:
+    for ti, df in enumerate(tables):
+        # همه‌ی سلول‌ها را رشته کن برای جستجوی 'تتر'
+        try:
+            df2 = df.copy()
+            # نرمال‌سازی برای بررسی
+            for c in df2.columns:
+                df2[c] = df2[c].astype(str).map(norm)
+        except Exception:
             continue
 
-        # ردیف تتر
-        row = df[df["عنوان"] == "تتر"]
-        if row.empty:
-            # بعضی وقت‌ها "تتر (USDT)" یا مشابه
-            row = df[df["عنوان"].str.contains("تتر", na=False)]
-        if row.empty:
-            continue
+        for ri in range(len(df2)):
+            row_vals = [df2.iloc[ri, ci] for ci in range(df2.shape[1])]
+            if not _row_contains_usdt(row_vals):
+                continue
 
-        val = row.iloc[0][price_col]
-        num = to_number(val)
-        if num is not None:
-            return float(num)
+            # از همین ردیف، هر عددی که داریم استخراج کنیم
+            nums = []
+            for ci in range(df.shape[1]):
+                val_raw = df.iloc[ri, ci]
+                num = to_number(val_raw)
+                if num is not None and num > 0:
+                    nums.append(num)
 
-    raise RuntimeError("قیمت تتر در صفحه crypto پیدا نشد. (ممکنه عنوان/ستون‌ها تغییر کرده باشند.)")
+            if not nums:
+                continue
+
+            # بهترین عدد: نزدیک‌ترین به usd_hint
+            for num in nums:
+                d = abs(num - usd_hint)
+                cand = (d, num, ti, ri)
+                if best_candidate is None or cand[0] < best_candidate[0]:
+                    best_candidate = cand
+
+    if best_candidate is None:
+        raise RuntimeError("ردیف/قیمت تتر در جدول‌های crypto پیدا نشد (احتمال تغییر ساختار صفحه یا محدودیت دسترسی).")
+
+    return float(best_candidate[1])
 
 
 # -------------------------
-# Bubble logic (USD from AED, USDT from USD)
+# Bubble logic
 # -------------------------
 def bubble_state_from_diff(diff: float) -> str:
     if diff > 0:
@@ -210,7 +212,7 @@ def bubble_state_from_diff(diff: float) -> str:
 
 
 def bubble_label_and_suggestion(diff: float) -> Tuple[str, str]:
-    # برای دلار/درهم (همان قبلی)
+    # همان قبلی: حباب دلار (USD - implied)
     if diff > 0:
         return "حباب مثبت دلار", "پیشنهاد: فروش دلار"
     elif diff < 0:
@@ -220,7 +222,6 @@ def bubble_label_and_suggestion(diff: float) -> Tuple[str, str]:
 
 
 def usdt_bubble_label(diff_usdt_minus_usd: float) -> str:
-    # تتر/دلار: اگر USDT > USD => حباب مثبت تتر/دلار
     if diff_usdt_minus_usd > 0:
         return "حباب مثبت تتر/دلار"
     elif diff_usdt_minus_usd < 0:
@@ -230,26 +231,23 @@ def usdt_bubble_label(diff_usdt_minus_usd: float) -> str:
 
 
 def usdt_trade_matrix(usd_aed_state: str, usdt_usd_state: str) -> str:
-    """
-    4 حالت طبق گفته‌ی شما (با positive/negative).
-    اگر neutral رخ داد، خروجی احتیاط/نامشخص می‌ده.
-    """
+    # اگر حالت خنثی شد (نادر) => احتیاط
     if usd_aed_state not in {"positive", "negative"} or usdt_usd_state not in {"positive", "negative"}:
         return "⚪️ وضعیت خنثی/نامشخص: تصمیم‌گیری احتیاطی (یکی از حباب‌ها نزدیک صفر است)"
 
-    # 1) منفی/منفی => زمان قطعی خرید تتر
+    # 1) دلار/درهم منفی + تتر/دلار منفی => زمان قطعی خرید تتر
     if usd_aed_state == "negative" and usdt_usd_state == "negative":
         return "🟢 زمان قطعی خرید تتر"
 
-    # 2) مثبت/منفی => زمان فروش محتاطانه تتر
+    # 2) دلار/درهم مثبت + تتر/دلار منفی => زمان فروش محتاطانه تتر
     if usd_aed_state == "positive" and usdt_usd_state == "negative":
         return "🟡 زمان فروش محتاطانه تتر"
 
-    # 3) منفی/مثبت => زمان خرید محتاطانه تتر
+    # 3) دلار/درهم منفی + تتر/دلار مثبت => زمان خرید محتاطانه تتر
     if usd_aed_state == "negative" and usdt_usd_state == "positive":
         return "🟡 زمان خرید محتاطانه تتر"
 
-    # 4) مثبت/مثبت => زمان قطعی فروش تتر
+    # 4) دلار/درهم مثبت + تتر/دلار مثبت => زمان قطعی فروش تتر
     if usd_aed_state == "positive" and usdt_usd_state == "positive":
         return "🔴 زمان قطعی فروش تتر"
 
@@ -298,7 +296,7 @@ def send_telegram(text: str):
 
 
 # -------------------------
-# Message builders (keep previous parts + add new parts)
+# Messages
 # -------------------------
 def build_main_message(
     date_sh: str,
@@ -317,11 +315,9 @@ def build_main_message(
     final_usdt_signal: str,
     rows_total: int,
 ) -> str:
-    # بخش قبلی (دلار/درهم) دست نخورده + فقط زیباسازی
     arrow_usd = "📈" if diff_usd > 0 else ("📉" if diff_usd < 0 else "➖")
     sign_usd = "➕" if diff_usd > 0 else ("➖" if diff_usd < 0 else "➖")
 
-    # بخش جدید (تتر/دلار)
     arrow_usdt = "📈" if diff_usdt > 0 else ("📉" if diff_usdt < 0 else "➖")
     sign_usdt = "➕" if diff_usdt > 0 else ("➖" if diff_usdt < 0 else "➖")
 
@@ -345,14 +341,10 @@ def build_main_message(
 
 
 def build_alert_change_message(title: str, prev_state: str, new_state: str, date_sh: str, time_sh: str, diff: float, pct: float) -> str:
-    mapping = {
-        "positive": "حباب مثبت",
-        "negative": "حباب منفی",
-        "neutral": "خنثی",
-    }
+    mapping = {"positive": "مثبت", "negative": "منفی", "neutral": "خنثی"}
     return (
         f"🚨 هشدار تغییر وضعیت ({title})\n"
-        f"🔄 {mapping.get(prev_state, prev_state)}  ➜  {mapping.get(new_state, new_state)}\n"
+        f"🔄 {mapping.get(prev_state, prev_state)} ➜ {mapping.get(new_state, new_state)}\n"
         f"🗓 {date_sh}  ⏰ {time_sh}\n"
         f"Diff: {diff:+.2f} تومان | {pct:+.4f}%"
     )
@@ -364,7 +356,7 @@ def build_alert_change_message(title: str, prev_state: str, new_state: str, date
 def main():
     date_sh, time_sh = jalali_now_str()
 
-    # 1) USD + AED from currency
+    # 1) USD + AED
     usd, aed = fetch_live_usd_aed_from_currency()
 
     implied_usd = aed * AED_TO_USD_REF
@@ -374,14 +366,14 @@ def main():
     bubble_usd_label, suggestion_usd = bubble_label_and_suggestion(diff_usd)
     usd_aed_state = bubble_state_from_diff(diff_usd)
 
-    # 2) USDT from crypto, compare with USD
-    usdt = fetch_live_usdt_from_crypto()
+    # 2) USDT from crypto (robust) compare with USD
+    usdt = fetch_live_usdt_from_crypto(usd_hint=usd)
     diff_usdt = usdt - usd
     pct_usdt = (diff_usdt / usd * 100) if usd else 0.0
     usdt_state = bubble_state_from_diff(diff_usdt)
     usdt_label = usdt_bubble_label(diff_usdt)
 
-    # 3) Final matrix signal for USDT trading
+    # 3) Final matrix signal
     final_usdt_signal = usdt_trade_matrix(usd_aed_state, usdt_state)
 
     # round for storage
@@ -409,7 +401,7 @@ def main():
         "suggestion": suggestion_usd,
         "source": "tgju.org/currency",
 
-        # جدیدها (بدون دست زدن به قبلی‌ها)
+        # جدیدها (به قبلی‌ها دست نخورده)
         "usdt": usdt_r,
         "diff_usdt_minus_usd": diff_usdt_r,
         "usdt_bubble_percent": pct_usdt_r,
@@ -442,13 +434,13 @@ def main():
     # پیام اصلی: همیشه
     send_telegram(main_msg)
 
-    # هشدارها: تغییر وضعیت دلار/درهم (قبلی) + (اضافه) تغییر وضعیت تتر/دلار
+    # هشدار تغییر وضعیت: دلار/درهم + تتر/دلار
     prev = load_prev_state() or {}
     prev_usd_state = prev.get("bubble_state")
     prev_usdt_state = prev.get("usdt_bubble_state")
 
     if prev_usd_state and prev_usd_state != usd_aed_state:
-        alert = build_alert_change_message(
+        send_telegram(build_alert_change_message(
             title="USD/AED",
             prev_state=prev_usd_state,
             new_state=usd_aed_state,
@@ -456,11 +448,10 @@ def main():
             time_sh=time_sh,
             diff=diff_usd_r,
             pct=pct_usd_r,
-        )
-        send_telegram(alert)
+        ))
 
     if prev_usdt_state and prev_usdt_state != usdt_state:
-        alert = build_alert_change_message(
+        send_telegram(build_alert_change_message(
             title="USDT/USD",
             prev_state=prev_usdt_state,
             new_state=usdt_state,
@@ -468,19 +459,16 @@ def main():
             time_sh=time_sh,
             diff=diff_usdt_r,
             pct=pct_usdt_r,
-        )
-        send_telegram(alert)
+        ))
 
-    # ذخیره state برای اجرای بعد
+    # ذخیره state
     save_state({
-        # قبلی
         "bubble_state": usd_aed_state,
         "last_date_shamsi": date_sh,
         "last_time": time_sh,
         "last_diff": diff_usd_r,
         "last_pct": pct_usd_r,
 
-        # جدید
         "usdt_bubble_state": usdt_state,
         "last_usdt_diff": diff_usdt_r,
         "last_usdt_pct": pct_usdt_r,
