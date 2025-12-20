@@ -14,11 +14,14 @@ import requests
 import pandas as pd
 
 # -------------------------
-# URLs (more stable than /currency and /crypto tables)
+# URLs
 # -------------------------
+# USD/AED from stable profile pages
 USD_PROFILE_URL = "https://www.tgju.org/profile/price_dollar_rl"
 AED_PROFILE_URL = "https://www.tgju.org/profile/price_aed"
-USDT_PROFILE_URL = "https://www.tgju.org/profile/crypto-tether"
+
+# USDT from fast-updating crypto table
+CRYPTO_URL = "https://www.tgju.org/crypto"
 
 AED_TO_USD_REF = 3.672
 
@@ -41,10 +44,29 @@ HEADERS = {
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
 
+# -------------------------
+# Normalization & parsing
+# -------------------------
 def norm(s: str) -> str:
+    """
+    Normalize Persian text for robust matching.
+    - Converts Persian digits to English digits
+    - Removes kashida 'ـ'
+    - Normalizes Arabic y/k to Persian ی/ک
+    - Removes zero-width characters
+    - Collapses whitespace
+    """
     if s is None:
         return ""
     s = str(s).strip().translate(PERSIAN_DIGITS)
+
+    # remove kashida (very common in TGJU headings e.g. ریـال, تتـر)
+    s = s.replace("ـ", "")
+
+    # normalize Arabic chars
+    s = s.replace("ي", "ی").replace("ك", "ک")
+
+    # remove zero-width marks
     s = s.replace("\u200c", " ").replace("\u200f", " ").replace("\u200e", " ")
     s = re.sub(r"\s+", " ", s)
     return s
@@ -123,10 +145,6 @@ RETRYABLE_STATUS = {403, 429, 500, 502, 503, 504}
 
 
 def _compute_backoff(attempt: int, base: float = 1.2, cap: float = 25.0) -> float:
-    """
-    Exponential backoff with jitter.
-    attempt starts at 1.
-    """
     expo = min(cap, base * (2 ** (attempt - 1)))
     jitter = random.uniform(0.0, 0.35 * expo)
     return expo + jitter
@@ -140,7 +158,6 @@ def http_get_text(url: str, timeout: int = 25, retries: int = 5) -> str:
         try:
             r = sess.get(url, headers=HEADERS, timeout=timeout)
 
-            # Retryable by status
             if r.status_code in RETRYABLE_STATUS:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
@@ -168,24 +185,14 @@ def http_get_text(url: str, timeout: int = 25, retries: int = 5) -> str:
 
 
 # -------------------------
-# Robust HTML extraction
+# Robust HTML extraction for profile pages
 # -------------------------
 def extract_value_after_label(html: str, label: str) -> Optional[str]:
-    """
-    Very permissive, designed for TGJU markup changes.
-    Finds a number near a Persian label like 'نرخ فعلی' or 'قیمت ریالی'.
-
-    Returns a raw numeric-like string (still may contain commas/spaces).
-    """
     if not html:
         return None
-
     h = html.translate(PERSIAN_DIGITS)
-
-    # Strategy A: label ... number
-    # Accept separators, tags, &nbsp; etc.
     label_pat = re.escape(label)
-    # Lookahead window to avoid grabbing unrelated large blocks
+
     m = re.search(
         rf"{label_pat}[\s:：]*?(?:</[^>]+>\s*)*([0-9][0-9,\.\s]*)",
         h,
@@ -194,7 +201,6 @@ def extract_value_after_label(html: str, label: str) -> Optional[str]:
     if m:
         return m.group(1).strip()
 
-    # Strategy B: in case number is inside tags right after label
     m = re.search(
         rf"{label_pat}(.{{0,250}}?)",
         h,
@@ -210,11 +216,6 @@ def extract_value_after_label(html: str, label: str) -> Optional[str]:
 
 
 def fetch_profile_kv_table(url: str) -> Tuple[Dict[str, str], str]:
-    """
-    Returns (kv_dict, html_text).
-    kv_dict: parsed from 2-col table like (خصیصه, مقادیر) if available.
-    html_text: always returned for regex fallback and optional logging.
-    """
     html = http_get_text(url)
     kv: Dict[str, str] = {}
 
@@ -248,16 +249,10 @@ def fetch_profile_kv_table(url: str) -> Tuple[Dict[str, str], str]:
 
 
 def get_rate_from_profile(url: str, label: str) -> Tuple[float, str]:
-    """
-    Returns (numeric_value, raw_value_string) for label from profile page.
-    First tries table KV, then regex fallback.
-    """
     kv, html = fetch_profile_kv_table(url)
 
-    raw = None
-    if label in kv:
-        raw = kv[label]
-    else:
+    raw = kv.get(label)
+    if not raw:
         raw = extract_value_after_label(html, label)
 
     num = to_number(raw)
@@ -273,9 +268,64 @@ def fetch_usd_aed_from_profiles() -> Tuple[float, float, str, str]:
     return usd, aed, usd_raw, aed_raw
 
 
-def fetch_usdt_irr_from_profile() -> Tuple[float, str]:
-    usdt, usdt_raw = get_rate_from_profile(USDT_PROFILE_URL, "قیمت ریالی")
-    return usdt, usdt_raw
+# -------------------------
+# USDT from /crypto table (fast update)
+# -------------------------
+def fetch_usdt_from_crypto() -> Tuple[float, str]:
+    """
+    Extract USDT price in Rial from TGJU /crypto table.
+    We pick the row where 'نماد' == USDT and read the column that contains both 'قیمت' and 'ریال'.
+    Returns (value_float, raw_string).
+    """
+    html = http_get_text(CRYPTO_URL)
+
+    tables = pd.read_html(StringIO(html))
+    if not tables:
+        raise RuntimeError("هیچ جدولی از صفحه crypto استخراج نشد (ممکن است سایت موقتاً محدود کرده باشد).")
+
+    for df in tables:
+        df2 = df.copy()
+        df2.columns = [norm(c) for c in df2.columns]
+
+        if "نماد" not in df2.columns:
+            continue
+
+        # find rial price column (handles ریـال/ریال)
+        rial_col = None
+        for c in df2.columns:
+            cn = norm(c)
+            if ("قیمت" in cn) and ("ریال" in cn):
+                rial_col = c
+                break
+        if rial_col is None:
+            continue
+
+        sym = df2["نماد"].astype(str).map(norm).str.upper()
+        row = df2[sym == "USDT"]
+
+        if row.empty:
+            # optional fallback: match by name column containing "تتر"
+            name_col = None
+            for c in df2.columns:
+                cn = norm(c)
+                if ("ارزهای دیجیتال" in cn) or ("عنوان" in cn) or ("نام" in cn):
+                    name_col = c
+                    break
+            if name_col is not None:
+                name = df2[name_col].astype(str).map(norm)
+                row = df2[name.str.contains("تتر", na=False) | name.str.contains("USDT", na=False)]
+
+        if row.empty:
+            continue
+
+        raw = row.iloc[0][rial_col]
+        num = to_number(raw)
+        if num is None or num <= 0:
+            raise RuntimeError(f"قیمت USDT از ستون ریالی قابل تبدیل نبود: {raw}")
+
+        return float(num), str(raw)
+
+    raise RuntimeError("جدول/ستون مناسب یا ردیف USDT در صفحه crypto پیدا نشد (احتمال تغییر ساختار صفحه).")
 
 
 # -------------------------
@@ -354,11 +404,6 @@ def append_csv(record: Dict[str, Any]) -> int:
 
 
 def send_telegram(text: str):
-    """
-    Default behavior:
-      - If TELEGRAM_REQUIRED=1 => strict (raise error if missing)
-      - Otherwise => if missing envs, just print and continue
-    """
     required = os.environ.get("TELEGRAM_REQUIRED", "").strip() == "1"
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -445,7 +490,7 @@ def build_alert_change_message(
 def main():
     date_sh, time_sh = jalali_now_str()
 
-    # USD + AED
+    # USD + AED (profiles)
     usd, aed, usd_raw, aed_raw = fetch_usd_aed_from_profiles()
     implied_usd = aed * AED_TO_USD_REF
     diff_usd = usd - implied_usd
@@ -453,8 +498,9 @@ def main():
     bubble_usd_label, suggestion_usd = bubble_label_and_suggestion(diff_usd)
     usd_aed_state = bubble_state_from_diff(diff_usd)
 
-    # USDT (IRR)
-    usdt, usdt_raw = fetch_usdt_irr_from_profile()
+    # USDT (crypto table)
+    usdt, usdt_raw = fetch_usdt_from_crypto()
+
     diff_usdt = usdt - usd
     pct_usdt = (diff_usdt / usd * 100) if usd else 0.0
     usdt_state = bubble_state_from_diff(diff_usdt)
@@ -473,7 +519,6 @@ def main():
     diff_usdt_r = round(diff_usdt, 2)
     pct_usdt_r = round(pct_usdt, 6)
 
-    # NEW: raw values logged too
     record = {
         "date_shamsi": date_sh,
         "time": time_sh,
@@ -499,7 +544,7 @@ def main():
         "usdt_bubble_state": usdt_state,
         "usdt_bubble_label": usdt_label,
         "usdt_final_signal": final_usdt_signal,
-        "usdt_source": USDT_PROFILE_URL,
+        "usdt_source": CRYPTO_URL,
     }
 
     rows_total = append_csv(record)
@@ -530,7 +575,6 @@ def main():
             "USDT/USD", prev_usdt_state, usdt_state, date_sh, time_sh, diff_usdt_r, pct_usdt_r
         ))
 
-    # NEW: store last raw values too (helps debugging when TGJU format changes)
     save_state({
         "bubble_state": usd_aed_state,
         "usdt_bubble_state": usdt_state,
