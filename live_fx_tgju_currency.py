@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import random
 from datetime import datetime
 from io import StringIO
 from typing import Tuple, Dict, Any, Optional
@@ -115,118 +117,165 @@ def jalali_now_str() -> Tuple[str, str]:
 
 
 # -------------------------
-# HTTP helpers (retry + stable extraction)
+# HTTP helpers (retry + backoff + jitter)
 # -------------------------
-def http_get_text(url: str, timeout: int = 25, retries: int = 3) -> str:
+RETRYABLE_STATUS = {403, 429, 500, 502, 503, 504}
+
+
+def _compute_backoff(attempt: int, base: float = 1.2, cap: float = 25.0) -> float:
+    """
+    Exponential backoff with jitter.
+    attempt starts at 1.
+    """
+    expo = min(cap, base * (2 ** (attempt - 1)))
+    jitter = random.uniform(0.0, 0.35 * expo)
+    return expo + jitter
+
+
+def http_get_text(url: str, timeout: int = 25, retries: int = 5) -> str:
     last_err = None
+    sess = requests.Session()
+
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r = sess.get(url, headers=HEADERS, timeout=timeout)
+
+            # Retryable by status
+            if r.status_code in RETRYABLE_STATUS:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    sleep_s = int(retry_after)
+                else:
+                    sleep_s = _compute_backoff(attempt)
+
+                if attempt < retries:
+                    print(f"⚠️ HTTP {r.status_code} برای {url} | retry in {sleep_s:.1f}s (attempt {attempt}/{retries})")
+                    time.sleep(sleep_s)
+                    continue
+
             r.raise_for_status()
             return r.text
+
         except Exception as e:
             last_err = e
+            if attempt >= retries:
+                break
+            sleep_s = _compute_backoff(attempt)
+            print(f"⚠️ خطای دریافت {url}: {e} | retry in {sleep_s:.1f}s (attempt {attempt}/{retries})")
+            time.sleep(sleep_s)
+
     raise RuntimeError(f"خطا در دریافت صفحه: {url} | {last_err}")
 
 
-def extract_value_by_label_regex(html: str, label: str) -> Optional[str]:
+# -------------------------
+# Robust HTML extraction
+# -------------------------
+def extract_value_after_label(html: str, label: str) -> Optional[str]:
     """
-    Fallback regex:
-    - find occurrences like: 'نرخ فعلی 1,322,000' or 'قیمت ریالی 1,313,590'
-    - return the first numeric-looking token after label
+    Very permissive, designed for TGJU markup changes.
+    Finds a number near a Persian label like 'نرخ فعلی' or 'قیمت ریالی'.
+
+    Returns a raw numeric-like string (still may contain commas/spaces).
     """
+    if not html:
+        return None
+
     h = html.translate(PERSIAN_DIGITS)
-    # keep it permissive because TGJU html can change
-    pattern = rf"{re.escape(label)}\s*[:：]?\s*([0-9][0-9,\.\s]*)"
-    m = re.search(pattern, h)
+
+    # Strategy A: label ... number
+    # Accept separators, tags, &nbsp; etc.
+    label_pat = re.escape(label)
+    # Lookahead window to avoid grabbing unrelated large blocks
+    m = re.search(
+        rf"{label_pat}[\s:：]*?(?:</[^>]+>\s*)*([0-9][0-9,\.\s]*)",
+        h,
+        flags=re.IGNORECASE,
+    )
     if m:
         return m.group(1).strip()
+
+    # Strategy B: in case number is inside tags right after label
+    m = re.search(
+        rf"{label_pat}(.{{0,250}}?)",
+        h,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        chunk = m.group(1)
+        n = re.search(r"([0-9][0-9,\.\s]*)", chunk)
+        if n:
+            return n.group(1).strip()
+
     return None
 
 
-def fetch_profile_kv_table(url: str) -> Dict[str, str]:
+def fetch_profile_kv_table(url: str) -> Tuple[Dict[str, str], str]:
     """
-    TGJU profile pages usually have a 2-column table:
-    'خصیصه' | 'مقادیر'
-    We convert it to dict.
+    Returns (kv_dict, html_text).
+    kv_dict: parsed from 2-col table like (خصیصه, مقادیر) if available.
+    html_text: always returned for regex fallback and optional logging.
     """
     html = http_get_text(url)
+    kv: Dict[str, str] = {}
+
     try:
         tables = pd.read_html(StringIO(html))
     except Exception:
         tables = []
 
-    # try to find the "خصیصه / مقادیر" table (or any 2-col table containing the keys)
     for t in tables:
         if t is None or t.empty:
             continue
         if t.shape[1] < 2:
             continue
 
-        df = t.copy()
-        df = df.iloc[:, :2]
+        df = t.copy().iloc[:, :2]
         df.columns = ["k", "v"]
         df["k"] = df["k"].astype(str).map(norm)
         df["v"] = df["v"].astype(str).map(norm)
 
         keys = set(df["k"].tolist())
         if ("نرخ فعلی" in keys) or ("قیمت ریالی" in keys) or ("زمان ثبت آخرین نرخ" in keys):
-            out = {}
             for _, row in df.iterrows():
                 k = row["k"]
                 v = row["v"]
                 if k and v:
-                    out[k] = v
-            if out:
-                return out
+                    kv[k] = v
+            if kv:
+                break
 
-    # fallback: regex on raw html
-    return {"__html__": html}
-
-
-def fetch_usd_aed_from_profiles() -> Tuple[float, float]:
-    usd_kv = fetch_profile_kv_table(USD_PROFILE_URL)
-    aed_kv = fetch_profile_kv_table(AED_PROFILE_URL)
-
-    def get_rate(kv: Dict[str, str], label: str, url: str) -> float:
-        if label in kv:
-            n = to_number(kv[label])
-            if n is not None and n > 0:
-                return float(n)
-
-        # regex fallback
-        html = kv.get("__html__")
-        if html:
-            s = extract_value_by_label_regex(html, label)
-            n = to_number(s) if s else None
-            if n is not None and n > 0:
-                return float(n)
-
-        raise RuntimeError(f"نتوانستم '{label}' را از صفحه استخراج کنم: {url}")
-
-    usd = get_rate(usd_kv, "نرخ فعلی", USD_PROFILE_URL)
-    aed = get_rate(aed_kv, "نرخ فعلی", AED_PROFILE_URL)
-    return usd, aed
+    return kv, html
 
 
-def fetch_usdt_irr_from_profile() -> float:
-    kv = fetch_profile_kv_table(USDT_PROFILE_URL)
+def get_rate_from_profile(url: str, label: str) -> Tuple[float, str]:
+    """
+    Returns (numeric_value, raw_value_string) for label from profile page.
+    First tries table KV, then regex fallback.
+    """
+    kv, html = fetch_profile_kv_table(url)
 
-    # IMPORTANT: We need Rial price for the bubble, not 1.0 USD
-    if "قیمت ریالی" in kv:
-        n = to_number(kv["قیمت ریالی"])
-        if n is not None and n > 0:
-            return float(n)
+    raw = None
+    if label in kv:
+        raw = kv[label]
+    else:
+        raw = extract_value_after_label(html, label)
 
-    # regex fallback
-    html = kv.get("__html__")
-    if html:
-        s = extract_value_by_label_regex(html, "قیمت ریالی")
-        n = to_number(s) if s else None
-        if n is not None and n > 0:
-            return float(n)
+    num = to_number(raw)
+    if num is None or num <= 0:
+        raise RuntimeError(f"نتوانستم '{label}' را از صفحه استخراج کنم: {url} | raw={raw}")
 
-    raise RuntimeError("قیمت ریالی تتر از پروفایل TGJU استخراج نشد (احتمال تغییر ساختار).")
+    return float(num), (raw or "")
+
+
+def fetch_usd_aed_from_profiles() -> Tuple[float, float, str, str]:
+    usd, usd_raw = get_rate_from_profile(USD_PROFILE_URL, "نرخ فعلی")
+    aed, aed_raw = get_rate_from_profile(AED_PROFILE_URL, "نرخ فعلی")
+    return usd, aed, usd_raw, aed_raw
+
+
+def fetch_usdt_irr_from_profile() -> Tuple[float, str]:
+    usdt, usdt_raw = get_rate_from_profile(USDT_PROFILE_URL, "قیمت ریالی")
+    return usdt, usdt_raw
 
 
 # -------------------------
@@ -372,7 +421,15 @@ def build_main_message(
     )
 
 
-def build_alert_change_message(title: str, prev_state: str, new_state: str, date_sh: str, time_sh: str, diff: float, pct: float) -> str:
+def build_alert_change_message(
+    title: str,
+    prev_state: str,
+    new_state: str,
+    date_sh: str,
+    time_sh: str,
+    diff: float,
+    pct: float
+) -> str:
     mapping = {"positive": "مثبت", "negative": "منفی", "neutral": "خنثی"}
     return (
         f"🚨 هشدار تغییر وضعیت ({title})\n"
@@ -388,16 +445,16 @@ def build_alert_change_message(title: str, prev_state: str, new_state: str, date
 def main():
     date_sh, time_sh = jalali_now_str()
 
-    # USD + AED (from stable profile pages)
-    usd, aed = fetch_usd_aed_from_profiles()
+    # USD + AED
+    usd, aed, usd_raw, aed_raw = fetch_usd_aed_from_profiles()
     implied_usd = aed * AED_TO_USD_REF
     diff_usd = usd - implied_usd
     pct_usd = (diff_usd / implied_usd * 100) if implied_usd else 0.0
     bubble_usd_label, suggestion_usd = bubble_label_and_suggestion(diff_usd)
     usd_aed_state = bubble_state_from_diff(diff_usd)
 
-    # USDT IRR (from stable USDT profile page => "قیمت ریالی")
-    usdt = fetch_usdt_irr_from_profile()
+    # USDT (IRR)
+    usdt, usdt_raw = fetch_usdt_irr_from_profile()
     diff_usdt = usdt - usd
     pct_usdt = (diff_usdt / usd * 100) if usd else 0.0
     usdt_state = bubble_state_from_diff(diff_usdt)
@@ -416,11 +473,16 @@ def main():
     diff_usdt_r = round(diff_usdt, 2)
     pct_usdt_r = round(pct_usdt, 6)
 
+    # NEW: raw values logged too
     record = {
         "date_shamsi": date_sh,
         "time": time_sh,
+
         "usd": usd_r,
+        "usd_raw": norm(usd_raw),
         "aed": aed_r,
+        "aed_raw": norm(aed_raw),
+
         "implied_usd_from_aed": implied_r,
         "diff_usd_minus_implied": diff_usd_r,
         "bubble_percent": pct_usd_r,
@@ -431,6 +493,7 @@ def main():
         "aed_source": AED_PROFILE_URL,
 
         "usdt": usdt_r,
+        "usdt_raw": norm(usdt_raw),
         "diff_usdt_minus_usd": diff_usdt_r,
         "usdt_bubble_percent": pct_usdt_r,
         "usdt_bubble_state": usdt_state,
@@ -458,14 +521,25 @@ def main():
     prev_usdt_state = prev.get("usdt_bubble_state")
 
     if prev_usd_state and prev_usd_state != usd_aed_state:
-        send_telegram(build_alert_change_message("USD/AED", prev_usd_state, usd_aed_state, date_sh, time_sh, diff_usd_r, pct_usd_r))
+        send_telegram(build_alert_change_message(
+            "USD/AED", prev_usd_state, usd_aed_state, date_sh, time_sh, diff_usd_r, pct_usd_r
+        ))
 
     if prev_usdt_state and prev_usdt_state != usdt_state:
-        send_telegram(build_alert_change_message("USDT/USD", prev_usdt_state, usdt_state, date_sh, time_sh, diff_usdt_r, pct_usdt_r))
+        send_telegram(build_alert_change_message(
+            "USDT/USD", prev_usdt_state, usdt_state, date_sh, time_sh, diff_usdt_r, pct_usdt_r
+        ))
 
+    # NEW: store last raw values too (helps debugging when TGJU format changes)
     save_state({
         "bubble_state": usd_aed_state,
         "usdt_bubble_state": usdt_state,
+        "last_raw": {
+            "usd_raw": norm(usd_raw),
+            "aed_raw": norm(aed_raw),
+            "usdt_raw": norm(usdt_raw),
+        },
+        "updated_at": f"{date_sh} {time_sh}",
     })
 
     print(main_msg)
