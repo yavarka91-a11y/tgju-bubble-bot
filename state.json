@@ -4,7 +4,18 @@
   "last_raw": {
     "usd_raw": "1329500",
     "aed_raw": "361950",
-    "usdt_raw": "1319500"
+    "usdt_raw": "1317600"
   },
-  "updated_at": "1404/10/01 20:00:38"
+  "updated_at": "1404/10/01 20:19:28",
+  "portfolio": {
+    "cash_irr": 100000000.0,
+    "usdt_qty": 0.0,
+    "position_open": false,
+    "entry_price": null,
+    "entry_value_irr": null,
+    "trade_count": 0,
+    "realized_pnl_irr": 0.0,
+    "last_action": null,
+    "last_action_time": null
+  }
 }
