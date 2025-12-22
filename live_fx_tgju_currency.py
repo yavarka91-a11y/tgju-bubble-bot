@@ -29,7 +29,7 @@ TRADES_CSV_PATH = "trades_backtest.csv"
 # -------------------------
 # Backtest config
 # -------------------------
-INITIAL_CASH_IRR = 1_000_000_000  # 100,000,000 ریال
+INITIAL_CASH_IRR = 1_000_000_000  # 1,000,000,000 ریال
 FEE_RATE = 0.0                 # مثلا 0.001 یعنی 0.1% کارمزد روی ارزش معامله
 USE_ALL_CAPITAL = True         # اگر False کنی، بعداً می‌تونیم درصدی خرید کنیم
 
@@ -415,21 +415,38 @@ def send_telegram(text: str):
 # -------------------------
 # Backtest portfolio engine
 # -------------------------
+def _new_portfolio() -> Dict[str, Any]:
+    return {
+        "initial_cash_irr": float(INITIAL_CASH_IRR),
+        "cash_irr": float(INITIAL_CASH_IRR),
+        "usdt_qty": 0.0,
+        "position_open": False,
+        "entry_price": None,       # IRR per USDT
+        "entry_value_irr": None,   # how much was spent on entry
+        "trade_count": 0,
+        "realized_pnl_irr": 0.0,
+        "last_action": None,       # "BUY"/"SELL"/None
+        "last_action_time": None,
+    }
+
+
 def ensure_portfolio(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Auto-fix: اگر INITIAL_CASH_IRR تغییر کند، پورتفوی ذخیره‌شده ریست می‌شود.
+    """
     port = state.get("portfolio")
+
     if not isinstance(port, dict):
-        port = {
-            "cash_irr": float(INITIAL_CASH_IRR),
-            "usdt_qty": 0.0,
-            "position_open": False,
-            "entry_price": None,  # IRR per USDT
-            "entry_value_irr": None,
-            "trade_count": 0,
-            "realized_pnl_irr": 0.0,
-            "last_action": None,  # "BUY"/"SELL"/None
-            "last_action_time": None,
-        }
+        port = _new_portfolio()
         state["portfolio"] = port
+        return port
+
+    saved_init = port.get("initial_cash_irr")
+    if saved_init is None or float(saved_init) != float(INITIAL_CASH_IRR):
+        # ریست خودکار با سرمایه جدید
+        port = _new_portfolio()
+        state["portfolio"] = port
+
     return port
 
 
@@ -456,12 +473,6 @@ def execute_backtest_step(
     date_sh: str,
     time_sh: str,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Executes:
-      - BUY on BUY_SIGNAL_TEXT if no position
-      - SELL on SELL_SIGNAL_TEXT if position open
-    Returns a trade record dict if trade executed, else None.
-    """
     cash = float(port.get("cash_irr", 0.0) or 0.0)
     qty = float(port.get("usdt_qty", 0.0) or 0.0)
     position_open = bool(port.get("position_open", False))
@@ -473,13 +484,14 @@ def execute_backtest_step(
         if cash <= 0:
             return None
 
-        spend_irr = cash if USE_ALL_CAPITAL else cash  # فعلاً همه سرمایه
+        spend_irr = cash if USE_ALL_CAPITAL else cash
         gross_qty = spend_irr / usdt_price_irr
+
         fee_irr = spend_irr * float(FEE_RATE)
-        net_spend_irr = spend_irr  # ما فرض می‌کنیم کارمزد از همان نقد کم می‌شود
+        net_spend_irr = spend_irr
         cash_after = cash - net_spend_irr - fee_irr
+
         if cash_after < -1e-6:
-            # اگر کارمزد باعث منفی شد، مقدار را adjust کن
             spend_irr_adj = cash / (1.0 + float(FEE_RATE))
             gross_qty = spend_irr_adj / usdt_price_irr
             fee_irr = spend_irr_adj * float(FEE_RATE)
@@ -596,7 +608,6 @@ def build_main_message(
     cash = float(port.get("cash_irr", 0.0) or 0.0)
     qty = float(port.get("usdt_qty", 0.0) or 0.0)
     position = "باز" if port.get("position_open") else "نداریم"
-
     entry_price = port.get("entry_price")
     entry_line = f"Entry: {fmt_int(entry_price)} ریال" if entry_price else "Entry: —"
 
@@ -616,6 +627,7 @@ def build_main_message(
         f"⚠️ {usdt_label}\n\n"
         f"🎯 سیگنال نهایی تتر: {final_usdt_signal}\n\n"
         "🧪 Backtest Portfolio (فرضی)\n"
+        f"• سرمایه اولیه: {fmt_int(port.get('initial_cash_irr', INITIAL_CASH_IRR))} ریال\n"
         f"• پوزیشن: {position}\n"
         f"• Cash: {fmt_int(cash)} ریال\n"
         f"• USDT: {fmt_float(qty, 8)}\n"
@@ -627,8 +639,7 @@ def build_main_message(
     )
 
 
-def build_trade_message(tr: Dict[str, Any], port: Dict[str, Any]) -> str:
-    # پیام تلگرام بعد از هر معامله
+def build_trade_message(tr: Dict[str, Any]) -> str:
     return (
         "🧪 Backtest Trade Executed\n"
         f"🧾 Trade #{tr['trade_id']} | {tr['action']}\n"
@@ -652,11 +663,10 @@ def build_trade_message(tr: Dict[str, Any], port: Dict[str, Any]) -> str:
 def main():
     date_sh, time_sh = jalali_now_str()
 
-    # Load state
     state = load_prev_state() or {}
     port = ensure_portfolio(state)
 
-    # USD + AED (profiles)
+    # USD + AED
     usd, aed, usd_raw, aed_raw = fetch_usd_aed_from_profiles()
     implied_usd = aed * AED_TO_USD_REF
     diff_usd = usd - implied_usd
@@ -664,7 +674,7 @@ def main():
     bubble_usd_label, suggestion_usd = bubble_label_and_suggestion(diff_usd)
     usd_aed_state = bubble_state_from_diff(diff_usd)
 
-    # USDT (crypto table)
+    # USDT
     usdt, usdt_raw = fetch_usdt_from_crypto()
     diff_usdt = usdt - usd
     pct_usdt = (diff_usdt / usd * 100) if usd else 0.0
@@ -673,9 +683,7 @@ def main():
 
     final_usdt_signal = usdt_trade_matrix(usd_aed_state, usdt_state)
 
-    # -------------------------
-    # Backtest trade execution
-    # -------------------------
+    # Execute trade step
     trade = execute_backtest_step(
         port=port,
         signal=final_usdt_signal,
@@ -684,7 +692,7 @@ def main():
         time_sh=time_sh,
     )
 
-    # round for storage
+    # round snapshot
     usd_r = round(usd, 2)
     aed_r = round(aed, 2)
     implied_r = round(implied_usd, 2)
@@ -695,8 +703,7 @@ def main():
     diff_usdt_r = round(diff_usdt, 2)
     pct_usdt_r = round(pct_usdt, 6)
 
-    # Snapshot record (each run)
-    record = {
+    snapshot = {
         "date_shamsi": date_sh,
         "time": time_sh,
 
@@ -723,7 +730,7 @@ def main():
         "usdt_final_signal": final_usdt_signal,
         "usdt_source": CRYPTO_URL,
 
-        # Portfolio snapshot
+        "bt_initial_cash_irr": round(float(port.get("initial_cash_irr", INITIAL_CASH_IRR)), 2),
         "bt_cash_irr": round(float(port.get("cash_irr", 0.0) or 0.0), 2),
         "bt_usdt_qty": round(float(port.get("usdt_qty", 0.0) or 0.0), 8),
         "bt_position_open": bool(port.get("position_open", False)),
@@ -733,9 +740,8 @@ def main():
         "bt_unrealized_pnl_irr": round(portfolio_unrealized_pnl_irr(port, usdt), 2),
     }
 
-    rows_total = append_csv(CSV_PATH, record)
+    rows_total = append_csv(CSV_PATH, snapshot)
 
-    # Main message (every run)
     main_msg = build_main_message(
         date_sh, time_sh,
         usd_r, aed_r, implied_r,
@@ -746,37 +752,13 @@ def main():
         rows_total,
         port,
     )
-
     send_telegram(main_msg)
 
-    # If a trade executed, log + telegram
     if trade is not None:
         append_csv(TRADES_CSV_PATH, trade)
-        send_telegram(build_trade_message(trade, port))
+        send_telegram(build_trade_message(trade))
 
-    # Alerts on bubble state changes (مثل قبل)
-    prev_usd_state = state.get("bubble_state")
-    prev_usdt_state = state.get("usdt_bubble_state")
-
-    if prev_usd_state and prev_usd_state != usd_aed_state:
-        msg = (
-            "🚨 هشدار تغییر وضعیت (USD/AED)\n"
-            f"🔄 {prev_usd_state} ➜ {usd_aed_state}\n"
-            f"🗓 {date_sh}  ⏰ {time_sh}\n"
-            f"Diff: {diff_usd_r:+.2f} تومان | {pct_usd_r:+.4f}%"
-        )
-        send_telegram(msg)
-
-    if prev_usdt_state and prev_usdt_state != usdt_state:
-        msg = (
-            "🚨 هشدار تغییر وضعیت (USDT/USD)\n"
-            f"🔄 {prev_usdt_state} ➜ {usdt_state}\n"
-            f"🗓 {date_sh}  ⏰ {time_sh}\n"
-            f"Diff: {diff_usdt_r:+.2f} تومان | {pct_usdt_r:+.4f}%"
-        )
-        send_telegram(msg)
-
-    # Save state
+    # save state
     state["bubble_state"] = usd_aed_state
     state["usdt_bubble_state"] = usdt_state
     state["last_raw"] = {
@@ -786,7 +768,6 @@ def main():
     }
     state["portfolio"] = port
     state["updated_at"] = f"{date_sh} {time_sh}"
-
     save_state(state)
 
     print(main_msg)
