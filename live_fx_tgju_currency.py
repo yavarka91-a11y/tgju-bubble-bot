@@ -16,17 +16,25 @@ import pandas as pd
 # -------------------------
 # URLs
 # -------------------------
-# USD/AED from stable profile pages
 USD_PROFILE_URL = "https://www.tgju.org/profile/price_dollar_rl"
 AED_PROFILE_URL = "https://www.tgju.org/profile/price_aed"
-
-# USDT from fast-updating crypto table
-CRYPTO_URL = "https://www.tgju.org/crypto"
+CRYPTO_URL = "https://www.tgju.org/crypto"  # USDT fast table
 
 AED_TO_USD_REF = 3.672
 
 CSV_PATH = "live_fx_snapshots.csv"
 STATE_PATH = "state.json"
+TRADES_CSV_PATH = "trades_backtest.csv"
+
+# -------------------------
+# Backtest config
+# -------------------------
+INITIAL_CASH_IRR = 100_000_000  # 100,000,000 ریال
+FEE_RATE = 0.0                 # مثلا 0.001 یعنی 0.1% کارمزد روی ارزش معامله
+USE_ALL_CAPITAL = True         # اگر False کنی، بعداً می‌تونیم درصدی خرید کنیم
+
+BUY_SIGNAL_TEXT = "🟢 زمان قطعی خرید تتر"
+SELL_SIGNAL_TEXT = "🔴 زمان قطعی فروش تتر"
 
 HEADERS = {
     "User-Agent": (
@@ -48,25 +56,11 @@ PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 # Normalization & parsing
 # -------------------------
 def norm(s: str) -> str:
-    """
-    Normalize Persian text for robust matching.
-    - Converts Persian digits to English digits
-    - Removes kashida 'ـ'
-    - Normalizes Arabic y/k to Persian ی/ک
-    - Removes zero-width characters
-    - Collapses whitespace
-    """
     if s is None:
         return ""
     s = str(s).strip().translate(PERSIAN_DIGITS)
-
-    # remove kashida (very common in TGJU headings e.g. ریـال, تتـر)
-    s = s.replace("ـ", "")
-
-    # normalize Arabic chars
+    s = s.replace("ـ", "")  # kashida
     s = s.replace("ي", "ی").replace("ك", "ک")
-
-    # remove zero-width marks
     s = s.replace("\u200c", " ").replace("\u200f", " ").replace("\u200e", " ")
     s = re.sub(r"\s+", " ", s)
     return s
@@ -88,6 +82,13 @@ def to_number(x) -> float | None:
 def fmt_int(n: float | int) -> str:
     try:
         return f"{int(round(float(n))):,}"
+    except Exception:
+        return str(n)
+
+
+def fmt_float(n: float, digits: int = 6) -> str:
+    try:
+        return f"{float(n):.{digits}f}"
     except Exception:
         return str(n)
 
@@ -185,7 +186,7 @@ def http_get_text(url: str, timeout: int = 25, retries: int = 5) -> str:
 
 
 # -------------------------
-# Robust HTML extraction for profile pages
+# Robust extraction for profile pages (USD/AED)
 # -------------------------
 def extract_value_after_label(html: str, label: str) -> Optional[str]:
     if not html:
@@ -250,15 +251,12 @@ def fetch_profile_kv_table(url: str) -> Tuple[Dict[str, str], str]:
 
 def get_rate_from_profile(url: str, label: str) -> Tuple[float, str]:
     kv, html = fetch_profile_kv_table(url)
-
     raw = kv.get(label)
     if not raw:
         raw = extract_value_after_label(html, label)
-
     num = to_number(raw)
     if num is None or num <= 0:
         raise RuntimeError(f"نتوانستم '{label}' را از صفحه استخراج کنم: {url} | raw={raw}")
-
     return float(num), (raw or "")
 
 
@@ -272,11 +270,6 @@ def fetch_usd_aed_from_profiles() -> Tuple[float, float, str, str]:
 # USDT from /crypto table (fast update)
 # -------------------------
 def fetch_usdt_from_crypto() -> Tuple[float, str]:
-    """
-    Extract USDT price in Rial from TGJU /crypto table.
-    We pick the row where 'نماد' == USDT and read the column that contains both 'قیمت' and 'ریال'.
-    Returns (value_float, raw_string).
-    """
     html = http_get_text(CRYPTO_URL)
 
     tables = pd.read_html(StringIO(html))
@@ -290,7 +283,6 @@ def fetch_usdt_from_crypto() -> Tuple[float, str]:
         if "نماد" not in df2.columns:
             continue
 
-        # find rial price column (handles ریـال/ریال)
         rial_col = None
         for c in df2.columns:
             cn = norm(c)
@@ -304,7 +296,6 @@ def fetch_usdt_from_crypto() -> Tuple[float, str]:
         row = df2[sym == "USDT"]
 
         if row.empty:
-            # optional fallback: match by name column containing "تتر"
             name_col = None
             for c in df2.columns:
                 cn = norm(c)
@@ -363,13 +354,13 @@ def usdt_trade_matrix(usd_aed_state: str, usdt_usd_state: str) -> str:
         return "⚪️ وضعیت خنثی/نامشخص (یکی از حباب‌ها نزدیک صفر است)"
 
     if usd_aed_state == "negative" and usdt_usd_state == "negative":
-        return "🟢 زمان قطعی خرید تتر"
+        return BUY_SIGNAL_TEXT
     if usd_aed_state == "positive" and usdt_usd_state == "negative":
         return "🟡 زمان فروش محتاطانه تتر"
     if usd_aed_state == "negative" and usdt_usd_state == "positive":
         return "🟡 زمان خرید محتاطانه تتر"
     if usd_aed_state == "positive" and usdt_usd_state == "positive":
-        return "🔴 زمان قطعی فروش تتر"
+        return SELL_SIGNAL_TEXT
 
     return "⚪️ نامشخص"
 
@@ -392,14 +383,14 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def append_csv(record: Dict[str, Any]) -> int:
+def append_csv(path: str, record: Dict[str, Any]) -> int:
     df_new = pd.DataFrame([record])
-    if os.path.exists(CSV_PATH):
-        df_old = pd.read_csv(CSV_PATH)
+    if os.path.exists(path):
+        df_old = pd.read_csv(path)
         df_all = pd.concat([df_old, df_new], ignore_index=True)
     else:
         df_all = df_new
-    df_all.to_csv(CSV_PATH, index=False, encoding="utf-8-sig")
+    df_all.to_csv(path, index=False, encoding="utf-8-sig")
     return len(df_all)
 
 
@@ -422,6 +413,157 @@ def send_telegram(text: str):
 
 
 # -------------------------
+# Backtest portfolio engine
+# -------------------------
+def ensure_portfolio(state: Dict[str, Any]) -> Dict[str, Any]:
+    port = state.get("portfolio")
+    if not isinstance(port, dict):
+        port = {
+            "cash_irr": float(INITIAL_CASH_IRR),
+            "usdt_qty": 0.0,
+            "position_open": False,
+            "entry_price": None,  # IRR per USDT
+            "entry_value_irr": None,
+            "trade_count": 0,
+            "realized_pnl_irr": 0.0,
+            "last_action": None,  # "BUY"/"SELL"/None
+            "last_action_time": None,
+        }
+        state["portfolio"] = port
+    return port
+
+
+def portfolio_equity_irr(port: Dict[str, Any], usdt_price_irr: float) -> float:
+    cash = float(port.get("cash_irr", 0.0) or 0.0)
+    qty = float(port.get("usdt_qty", 0.0) or 0.0)
+    return cash + qty * usdt_price_irr
+
+
+def portfolio_unrealized_pnl_irr(port: Dict[str, Any], usdt_price_irr: float) -> float:
+    if not port.get("position_open"):
+        return 0.0
+    entry = port.get("entry_price")
+    qty = float(port.get("usdt_qty", 0.0) or 0.0)
+    if entry is None:
+        return 0.0
+    return (usdt_price_irr - float(entry)) * qty
+
+
+def execute_backtest_step(
+    port: Dict[str, Any],
+    signal: str,
+    usdt_price_irr: float,
+    date_sh: str,
+    time_sh: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Executes:
+      - BUY on BUY_SIGNAL_TEXT if no position
+      - SELL on SELL_SIGNAL_TEXT if position open
+    Returns a trade record dict if trade executed, else None.
+    """
+    cash = float(port.get("cash_irr", 0.0) or 0.0)
+    qty = float(port.get("usdt_qty", 0.0) or 0.0)
+    position_open = bool(port.get("position_open", False))
+    realized = float(port.get("realized_pnl_irr", 0.0) or 0.0)
+    trade_count = int(port.get("trade_count", 0) or 0)
+
+    # BUY
+    if signal == BUY_SIGNAL_TEXT and not position_open:
+        if cash <= 0:
+            return None
+
+        spend_irr = cash if USE_ALL_CAPITAL else cash  # فعلاً همه سرمایه
+        gross_qty = spend_irr / usdt_price_irr
+        fee_irr = spend_irr * float(FEE_RATE)
+        net_spend_irr = spend_irr  # ما فرض می‌کنیم کارمزد از همان نقد کم می‌شود
+        cash_after = cash - net_spend_irr - fee_irr
+        if cash_after < -1e-6:
+            # اگر کارمزد باعث منفی شد، مقدار را adjust کن
+            spend_irr_adj = cash / (1.0 + float(FEE_RATE))
+            gross_qty = spend_irr_adj / usdt_price_irr
+            fee_irr = spend_irr_adj * float(FEE_RATE)
+            net_spend_irr = spend_irr_adj
+            cash_after = cash - net_spend_irr - fee_irr
+
+        qty_after = qty + gross_qty
+
+        trade_count += 1
+        port["cash_irr"] = float(cash_after)
+        port["usdt_qty"] = float(qty_after)
+        port["position_open"] = True
+        port["entry_price"] = float(usdt_price_irr)
+        port["entry_value_irr"] = float(net_spend_irr)
+        port["trade_count"] = trade_count
+        port["last_action"] = "BUY"
+        port["last_action_time"] = f"{date_sh} {time_sh}"
+
+        equity = portfolio_equity_irr(port, usdt_price_irr)
+
+        return {
+            "trade_id": trade_count,
+            "date_shamsi": date_sh,
+            "time": time_sh,
+            "action": "BUY",
+            "signal": signal,
+            "price_irr": round(usdt_price_irr, 2),
+            "qty_usdt": round(gross_qty, 8),
+            "gross_value_irr": round(net_spend_irr, 2),
+            "fee_irr": round(fee_irr, 2),
+            "pnl_trade_irr": 0.0,
+            "pnl_realized_total_irr": round(realized, 2),
+            "cash_after_irr": round(float(port["cash_irr"]), 2),
+            "usdt_after": round(float(port["usdt_qty"]), 8),
+            "equity_after_irr": round(equity, 2),
+        }
+
+    # SELL
+    if signal == SELL_SIGNAL_TEXT and position_open and qty > 0:
+        entry_price = float(port.get("entry_price") or 0.0)
+        gross_proceeds = qty * usdt_price_irr
+        fee_irr = gross_proceeds * float(FEE_RATE)
+        net_proceeds = gross_proceeds - fee_irr
+
+        pnl_trade = (usdt_price_irr - entry_price) * qty - fee_irr
+        realized_after = realized + pnl_trade
+
+        cash_after = cash + net_proceeds
+        qty_after = 0.0
+
+        trade_count += 1
+        port["cash_irr"] = float(cash_after)
+        port["usdt_qty"] = float(qty_after)
+        port["position_open"] = False
+        port["entry_price"] = None
+        port["entry_value_irr"] = None
+        port["trade_count"] = trade_count
+        port["realized_pnl_irr"] = float(realized_after)
+        port["last_action"] = "SELL"
+        port["last_action_time"] = f"{date_sh} {time_sh}"
+
+        equity = portfolio_equity_irr(port, usdt_price_irr)
+
+        return {
+            "trade_id": trade_count,
+            "date_shamsi": date_sh,
+            "time": time_sh,
+            "action": "SELL",
+            "signal": signal,
+            "price_irr": round(usdt_price_irr, 2),
+            "qty_usdt": round(qty, 8),
+            "gross_value_irr": round(gross_proceeds, 2),
+            "fee_irr": round(fee_irr, 2),
+            "pnl_trade_irr": round(pnl_trade, 2),
+            "pnl_realized_total_irr": round(realized_after, 2),
+            "cash_after_irr": round(float(port["cash_irr"]), 2),
+            "usdt_after": round(float(port["usdt_qty"]), 8),
+            "equity_after_irr": round(equity, 2),
+        }
+
+    return None
+
+
+# -------------------------
 # Messages
 # -------------------------
 def build_main_message(
@@ -440,12 +582,23 @@ def build_main_message(
     usdt_label: str,
     final_usdt_signal: str,
     rows_total: int,
+    port: Dict[str, Any],
 ) -> str:
     arrow_usd = "📈" if diff_usd > 0 else ("📉" if diff_usd < 0 else "➖")
     sign_usd = "➕" if diff_usd > 0 else ("➖" if diff_usd < 0 else "➖")
 
     arrow_usdt = "📈" if diff_usdt > 0 else ("📉" if diff_usdt < 0 else "➖")
     sign_usdt = "➕" if diff_usdt > 0 else ("➖" if diff_usdt < 0 else "➖")
+
+    equity = portfolio_equity_irr(port, usdt)
+    unreal = portfolio_unrealized_pnl_irr(port, usdt)
+    realized = float(port.get("realized_pnl_irr", 0.0) or 0.0)
+    cash = float(port.get("cash_irr", 0.0) or 0.0)
+    qty = float(port.get("usdt_qty", 0.0) or 0.0)
+    position = "باز" if port.get("position_open") else "نداریم"
+
+    entry_price = port.get("entry_price")
+    entry_line = f"Entry: {fmt_int(entry_price)} ریال" if entry_price else "Entry: —"
 
     return (
         "📊 TGJU Bubble Monitor\n"
@@ -462,25 +615,34 @@ def build_main_message(
         f"{arrow_usdt} USDT-USD Diff: {sign_usdt} {fmt_int(abs(diff_usdt))} تومان   ({pct_usdt:+.4f}%)\n"
         f"⚠️ {usdt_label}\n\n"
         f"🎯 سیگنال نهایی تتر: {final_usdt_signal}\n\n"
+        "🧪 Backtest Portfolio (فرضی)\n"
+        f"• پوزیشن: {position}\n"
+        f"• Cash: {fmt_int(cash)} ریال\n"
+        f"• USDT: {fmt_float(qty, 8)}\n"
+        f"• {entry_line}\n"
+        f"• Unrealized PnL: {fmt_int(unreal)} ریال\n"
+        f"• Realized PnL (کل): {fmt_int(realized)} ریال\n"
+        f"• Equity (دارایی کل): {fmt_int(equity)} ریال\n\n"
         f"🧾 Rows stored: {rows_total}"
     )
 
 
-def build_alert_change_message(
-    title: str,
-    prev_state: str,
-    new_state: str,
-    date_sh: str,
-    time_sh: str,
-    diff: float,
-    pct: float
-) -> str:
-    mapping = {"positive": "مثبت", "negative": "منفی", "neutral": "خنثی"}
+def build_trade_message(tr: Dict[str, Any], port: Dict[str, Any]) -> str:
+    # پیام تلگرام بعد از هر معامله
     return (
-        f"🚨 هشدار تغییر وضعیت ({title})\n"
-        f"🔄 {mapping.get(prev_state, prev_state)} ➜ {mapping.get(new_state, new_state)}\n"
-        f"🗓 {date_sh}  ⏰ {time_sh}\n"
-        f"Diff: {diff:+.2f} تومان | {pct:+.4f}%"
+        "🧪 Backtest Trade Executed\n"
+        f"🧾 Trade #{tr['trade_id']} | {tr['action']}\n"
+        f"🗓 {tr['date_shamsi']} ⏰ {tr['time']}\n"
+        f"🎯 Signal: {tr['signal']}\n\n"
+        f"💰 Price: {fmt_int(tr['price_irr'])} ریال\n"
+        f"🪙 Qty: {fmt_float(tr['qty_usdt'], 8)} USDT\n"
+        f"🏷 Value: {fmt_int(tr['gross_value_irr'])} ریال\n"
+        f"🧾 Fee: {fmt_int(tr['fee_irr'])} ریال\n\n"
+        f"📈 PnL (این معامله): {fmt_int(tr['pnl_trade_irr'])} ریال\n"
+        f"📊 PnL (تجمعی): {fmt_int(tr['pnl_realized_total_irr'])} ریال\n"
+        f"💼 Cash: {fmt_int(tr['cash_after_irr'])} ریال\n"
+        f"🪙 USDT: {fmt_float(tr['usdt_after'], 8)}\n"
+        f"🧮 Equity: {fmt_int(tr['equity_after_irr'])} ریال"
     )
 
 
@@ -489,6 +651,10 @@ def build_alert_change_message(
 # -------------------------
 def main():
     date_sh, time_sh = jalali_now_str()
+
+    # Load state
+    state = load_prev_state() or {}
+    port = ensure_portfolio(state)
 
     # USD + AED (profiles)
     usd, aed, usd_raw, aed_raw = fetch_usd_aed_from_profiles()
@@ -500,13 +666,23 @@ def main():
 
     # USDT (crypto table)
     usdt, usdt_raw = fetch_usdt_from_crypto()
-
     diff_usdt = usdt - usd
     pct_usdt = (diff_usdt / usd * 100) if usd else 0.0
     usdt_state = bubble_state_from_diff(diff_usdt)
     usdt_label = usdt_bubble_label(diff_usdt)
 
     final_usdt_signal = usdt_trade_matrix(usd_aed_state, usdt_state)
+
+    # -------------------------
+    # Backtest trade execution
+    # -------------------------
+    trade = execute_backtest_step(
+        port=port,
+        signal=final_usdt_signal,
+        usdt_price_irr=usdt,
+        date_sh=date_sh,
+        time_sh=time_sh,
+    )
 
     # round for storage
     usd_r = round(usd, 2)
@@ -519,6 +695,7 @@ def main():
     diff_usdt_r = round(diff_usdt, 2)
     pct_usdt_r = round(pct_usdt, 6)
 
+    # Snapshot record (each run)
     record = {
         "date_shamsi": date_sh,
         "time": time_sh,
@@ -545,10 +722,20 @@ def main():
         "usdt_bubble_label": usdt_label,
         "usdt_final_signal": final_usdt_signal,
         "usdt_source": CRYPTO_URL,
+
+        # Portfolio snapshot
+        "bt_cash_irr": round(float(port.get("cash_irr", 0.0) or 0.0), 2),
+        "bt_usdt_qty": round(float(port.get("usdt_qty", 0.0) or 0.0), 8),
+        "bt_position_open": bool(port.get("position_open", False)),
+        "bt_entry_price": port.get("entry_price"),
+        "bt_realized_pnl_irr": round(float(port.get("realized_pnl_irr", 0.0) or 0.0), 2),
+        "bt_equity_irr": round(portfolio_equity_irr(port, usdt), 2),
+        "bt_unrealized_pnl_irr": round(portfolio_unrealized_pnl_irr(port, usdt), 2),
     }
 
-    rows_total = append_csv(record)
+    rows_total = append_csv(CSV_PATH, record)
 
+    # Main message (every run)
     main_msg = build_main_message(
         date_sh, time_sh,
         usd_r, aed_r, implied_r,
@@ -556,37 +743,56 @@ def main():
         bubble_usd_label, suggestion_usd,
         usdt_r, diff_usdt_r, pct_usdt_r,
         usdt_label, final_usdt_signal,
-        rows_total
+        rows_total,
+        port,
     )
 
     send_telegram(main_msg)
 
-    prev = load_prev_state() or {}
-    prev_usd_state = prev.get("bubble_state")
-    prev_usdt_state = prev.get("usdt_bubble_state")
+    # If a trade executed, log + telegram
+    if trade is not None:
+        append_csv(TRADES_CSV_PATH, trade)
+        send_telegram(build_trade_message(trade, port))
+
+    # Alerts on bubble state changes (مثل قبل)
+    prev_usd_state = state.get("bubble_state")
+    prev_usdt_state = state.get("usdt_bubble_state")
 
     if prev_usd_state and prev_usd_state != usd_aed_state:
-        send_telegram(build_alert_change_message(
-            "USD/AED", prev_usd_state, usd_aed_state, date_sh, time_sh, diff_usd_r, pct_usd_r
-        ))
+        msg = (
+            "🚨 هشدار تغییر وضعیت (USD/AED)\n"
+            f"🔄 {prev_usd_state} ➜ {usd_aed_state}\n"
+            f"🗓 {date_sh}  ⏰ {time_sh}\n"
+            f"Diff: {diff_usd_r:+.2f} تومان | {pct_usd_r:+.4f}%"
+        )
+        send_telegram(msg)
 
     if prev_usdt_state and prev_usdt_state != usdt_state:
-        send_telegram(build_alert_change_message(
-            "USDT/USD", prev_usdt_state, usdt_state, date_sh, time_sh, diff_usdt_r, pct_usdt_r
-        ))
+        msg = (
+            "🚨 هشدار تغییر وضعیت (USDT/USD)\n"
+            f"🔄 {prev_usdt_state} ➜ {usdt_state}\n"
+            f"🗓 {date_sh}  ⏰ {time_sh}\n"
+            f"Diff: {diff_usdt_r:+.2f} تومان | {pct_usdt_r:+.4f}%"
+        )
+        send_telegram(msg)
 
-    save_state({
-        "bubble_state": usd_aed_state,
-        "usdt_bubble_state": usdt_state,
-        "last_raw": {
-            "usd_raw": norm(usd_raw),
-            "aed_raw": norm(aed_raw),
-            "usdt_raw": norm(usdt_raw),
-        },
-        "updated_at": f"{date_sh} {time_sh}",
-    })
+    # Save state
+    state["bubble_state"] = usd_aed_state
+    state["usdt_bubble_state"] = usdt_state
+    state["last_raw"] = {
+        "usd_raw": norm(usd_raw),
+        "aed_raw": norm(aed_raw),
+        "usdt_raw": norm(usdt_raw),
+    }
+    state["portfolio"] = port
+    state["updated_at"] = f"{date_sh} {time_sh}"
+
+    save_state(state)
 
     print(main_msg)
+    if trade is not None:
+        print("\n--- TRADE EXECUTED ---")
+        print(trade)
 
 
 if __name__ == "__main__":
