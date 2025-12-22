@@ -1,10 +1,10 @@
 {
   "bubble_state": "negative",
-  "usdt_bubble_state": "positive",
+  "usdt_bubble_state": "negative",
   "last_raw": {
-    "usd_raw": "1319700",
-    "aed_raw": "359490",
-    "usdt_raw": "1321000"
+    "usd_raw": "1319900",
+    "aed_raw": "359570",
+    "usdt_raw": "1319400"
   },
-  "updated_at": "1404/10/01 10:49:32"
+  "updated_at": "1404/10/01 11:31:10"
 }
