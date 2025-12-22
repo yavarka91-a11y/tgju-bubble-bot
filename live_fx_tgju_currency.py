@@ -29,7 +29,7 @@ TRADES_CSV_PATH = "trades_backtest.csv"
 # -------------------------
 # Backtest config
 # -------------------------
-INITIAL_CASH_IRR = 100_000_000  # 100,000,000 ریال
+INITIAL_CASH_IRR = 1_000_000_000  # 100,000,000 ریال
 FEE_RATE = 0.0                 # مثلا 0.001 یعنی 0.1% کارمزد روی ارزش معامله
 USE_ALL_CAPITAL = True         # اگر False کنی، بعداً می‌تونیم درصدی خرید کنیم
 
