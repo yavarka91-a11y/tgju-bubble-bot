@@ -1,0 +1,2 @@
+﻿trade_id,date_shamsi,time,action,signal,price_irr,qty_usdt,gross_value_irr,fee_irr,pnl_trade_irr,pnl_realized_total_irr,cash_after_irr,usdt_after,equity_after_irr
+1,1404/10/02,07:44:30,BUY,🟢 زمان قطعی خرید تتر,1321100.0,754.30490294,996512207.27,3487792.73,0.0,0.0,0.0,754.30490294,996512207.27
