@@ -1,22 +1,22 @@
 {
   "bubble_state": "negative",
-  "usdt_bubble_state": "positive",
+  "usdt_bubble_state": "negative",
   "last_raw": {
-    "usd_raw": "1455300",
+    "usd_raw": "1455100",
     "aed_raw": "396580",
-    "usdt_raw": "1468400"
+    "usdt_raw": "1419700"
   },
-  "updated_at": "1404/10/24 17:02:10",
+  "updated_at": "1404/10/24 17:54:06",
   "portfolio": {
     "initial_cash_irr": 1000000000.0,
-    "cash_irr": 969187722.1743475,
-    "usdt_qty": 0.0,
-    "position_open": false,
-    "entry_price": null,
-    "entry_value_irr": null,
-    "trade_count": 10,
+    "cash_irr": 1.0989606380462646e-07,
+    "usdt_qty": 680.2897769157862,
+    "position_open": true,
+    "entry_price": 1419700.0,
+    "entry_value_irr": 965807396.2873417,
+    "trade_count": 11,
     "realized_pnl_irr": -13537717.569429561,
-    "last_action": "SELL",
-    "last_action_time": "1404/10/14 09:39:08"
+    "last_action": "BUY",
+    "last_action_time": "1404/10/24 17:54:06"
   }
 }
