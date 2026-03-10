@@ -2,11 +2,11 @@
   "bubble_state": "negative",
   "usdt_bubble_state": "negative",
   "last_raw": {
-    "usd_raw": "1663500",
-    "aed_raw": "453060",
-    "usdt_raw": "1511600"
+    "usd_raw": "1663450",
+    "aed_raw": "453210",
+    "usdt_raw": "1471300"
   },
-  "updated_at": "1404/12/19 00:00:39",
+  "updated_at": "1404/12/19 10:53:04",
   "portfolio": {
     "initial_cash_irr": 1000000000.0,
     "cash_irr": 6.984919309616089e-08,
